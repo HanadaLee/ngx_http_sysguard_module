@@ -1,0 +1,104 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: nginx-static
+            repository: nginx/nginx
+            ref: release-1.31.7
+            link: static
+            sanitize: disabled
+            expr: disabled
+          - name: nginx-dynamic
+            repository: nginx/nginx
+            ref: release-1.31.7
+            link: dynamic
+            sanitize: disabled
+            expr: disabled
+          - name: nginx-sanitizers
+            repository: nginx/nginx
+            ref: release-1.31.7
+            link: static
+            sanitize: enabled
+            expr: disabled
+          - name: nginx-ext
+            repository: HanadaLee/nginx-ext
+            ref: 6b68dccc6dd0ef559b7f98a65dc57db24ae23d2a
+            link: static
+            sanitize: disabled
+            expr: enabled
+    steps:
+      - name: Check out module
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check out nginx
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.ref }}
+          path: .ci/nginx
+          persist-credentials: false
+
+      - name: Check out ngx_expr_module
+        if: matrix.expr == 'enabled'
+        uses: actions/checkout@v6
+        with:
+          repository: HanadaLee/ngx_expr_module
+          ref: '1.0.0'
+          path: .ci/ngx_expr_module
+          persist-credentials: false
+
+      - name: Check out nginx-tests
+        uses: actions/checkout@v6
+        with:
+          repository: nginx/nginx-tests
+          ref: ec44bc80c4bfac1dbd8ffee3875101285f8502ac
+          path: .ci/nginx-tests
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libpcre2-dev zlib1g-dev perl util-linux
+
+      - name: Build and test
+        env:
+          TEST_MODULE_LINK: ${{ matrix.link }}
+          TEST_SANITIZE: ${{ matrix.sanitize }}
+          TEST_EXPR: ${{ matrix.expr }}
+        run: sudo --preserve-env=TEST_MODULE_LINK,TEST_SANITIZE,TEST_EXPR bash util/run-tests.sh
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-logs-${{ matrix.name }}
+          path: |
+            .ci/test-output/**/*.log
+            .ci/test-output/*.txt
+            .ci/test-output/results.tsv
+            .ci/test-output/exit-code
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
