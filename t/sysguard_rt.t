@@ -39,6 +39,14 @@ http {
             sysguard_rt rt=100 period=10 method=WMA:2;
             proxy_pass http://127.0.0.1:8081/;
         }
+        location /period/ {
+            sysguard_rt rt=100 period=2;
+            proxy_pass http://127.0.0.1:8081/;
+        }
+        location /expiry/ {
+            sysguard_rt rt=100 period=2 method=WMA:4;
+            proxy_pass http://127.0.0.1:8081/;
+        }
         location /origin/ {
             sysguard_rt rt=0.1 action=/limited;
             try_files /missing /backend/300;
@@ -66,14 +74,14 @@ for my $location (qw/default one/) {
     like(http_get("/$location/0"), qr/200 OK/, "$location recovers after expiry");
 }
 
-for my $method (qw/amm wma/) {
+for my $method (qw/amm wma period/) {
     like(http_get("/$method/150"), qr/X-RT: 0\r/i, "$method starts empty");
     my $r = http_get("/$method/450");
     my ($first) = $r =~ /X-RT: (\d+)/i;
     cmp_ok($first // 0, '>=', 130, "$method does not dilute a partial ring");
     $r = http_get("/$method/0");
     my ($avg) = $r =~ /X-RT: (\d+)/i;
-    my $expected = $method eq 'amm' ? 300 : 350;
+    my $expected = $method eq 'wma' ? 350 : 300;
     cmp_ok($avg // 0, '>=', $expected - 25, "$method average lower bound");
     cmp_ok($avg // 9999, '<=', $expected + 100, "$method average upper bound");
     http_get("/$method/0");
@@ -81,6 +89,14 @@ for my $method (qw/amm wma/) {
     my ($recent) = $r =~ /X-RT: (\d+)/i;
     cmp_ok($recent // 9999, '<', 100, "$method retains exactly the last two samples");
 }
+
+http_get('/expiry/450');
+sleep 1.4;
+http_get('/expiry/150');
+sleep 0.75;
+my ($remaining) = http_get('/expiry/0') =~ /X-RT: (\d+)/i;
+cmp_ok($remaining // 0, '>=', 130, 'expired samples do not dilute WMA');
+cmp_ok($remaining // 9999, '<', 300, 'expired slow sample is excluded');
 
 like(http_get('/origin/start'), qr/ok\n$/, 'accepted redirect reaches upstream');
 like(http_get('/origin/start'), qr/limited\n$/, 'RT is attributed to original location');

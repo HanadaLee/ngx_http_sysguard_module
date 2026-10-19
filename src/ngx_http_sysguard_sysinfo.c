@@ -49,7 +49,7 @@ ngx_http_sysguard_getloadavg(ngx_int_t *load, ngx_log_t *log)
 }
 
 
-#if (NGX_HAVE_PROC_MEMINFO)
+#if (NGX_HAVE_PROC_MEMINFO || NGX_LINUX)
 
 static ssize_t
 ngx_http_sysguard_read_file(char *name, u_char *buf, size_t size,
@@ -82,6 +82,11 @@ ngx_http_sysguard_read_file(char *name, u_char *buf, size_t size,
     return n;
 }
 
+
+#endif
+
+
+#if (NGX_HAVE_PROC_MEMINFO)
 
 ngx_int_t
 ngx_http_sysguard_getmeminfo(ngx_http_sysguard_meminfo_t *mem, ngx_log_t *log)
@@ -265,3 +270,65 @@ ngx_http_sysguard_getmeminfo(ngx_http_sysguard_meminfo_t *mem, ngx_log_t *log)
 }
 
 #endif
+
+
+ngx_int_t
+ngx_http_sysguard_getcpuinfo(ngx_http_sysguard_cpuinfo_t *info, ngx_log_t *log)
+{
+#if (NGX_LINUX)
+    u_char      *p, *end;
+    ssize_t      n;
+    uint64_t     value, digit;
+    ngx_uint_t   i;
+    u_char       buf[1024];
+
+    n = ngx_http_sysguard_read_file("/proc/stat", buf, sizeof(buf), log);
+    if (n < 5 || ngx_strncmp(buf, "cpu", 3) != 0
+        || (buf[3] != ' ' && buf[3] != '\t'))
+    {
+        goto invalid;
+    }
+
+    end = ngx_strlchr(buf, buf + n, '\n');
+    if (end == NULL) {
+        goto invalid;
+    }
+
+    p = buf + 3;
+
+    for (i = 0; i < 7; i++) {
+        while (p < end && (*p == ' ' || *p == '\t')) {
+            p++;
+        }
+
+        if (p == end || *p < '0' || *p > '9') {
+            goto invalid;
+        }
+
+        value = 0;
+        while (p < end && *p >= '0' && *p <= '9') {
+            digit = *p++ - '0';
+            if (value > ((uint64_t) -1 - digit) / 10) {
+                goto invalid;
+            }
+
+            value = value * 10 + digit;
+        }
+
+        if (p < end && *p != ' ' && *p != '\t') {
+            goto invalid;
+        }
+
+        info->times[i] = value;
+    }
+
+    return NGX_OK;
+
+invalid:
+
+    ngx_log_error(NGX_LOG_ERR, log, 0, "invalid /proc/stat CPU data");
+    return NGX_ERROR;
+#else
+    return NGX_ERROR;
+#endif
+}

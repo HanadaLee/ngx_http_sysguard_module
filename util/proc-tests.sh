@@ -17,4 +17,4 @@ trap 'rm -f "$TEST_SYSGUARD_FIXTURES/meminfo" "$TEST_SYSGUARD_FIXTURES/stat"; rm
 touch "$TEST_SYSGUARD_FIXTURES/meminfo" "$TEST_SYSGUARD_FIXTURES/stat"
 mount --bind "$TEST_SYSGUARD_FIXTURES/meminfo" /proc/meminfo
 mount --bind "$TEST_SYSGUARD_FIXTURES/stat" /proc/stat
-prove -v "$module_root/t/sysguard_system.t"
+prove -v "$module_root/t/sysguard_system.t" "$module_root/t/sysguard_cpu.t"

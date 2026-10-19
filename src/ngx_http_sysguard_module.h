@@ -23,6 +23,9 @@
 
 typedef struct {
     ngx_flag_t                       enable;
+    ngx_int_t                        cpu;
+    time_t                           cpu_period;
+    ngx_str_t                        cpu_action;
     ngx_int_t                        load;
     ngx_str_t                        load_action;
     ngx_int_t                        swap;
@@ -42,6 +45,8 @@ typedef struct {
 } ngx_http_sysguard_conf_t;
 
 
+ngx_int_t ngx_http_sysguard_update_cpu(ngx_http_request_t *r,
+    ngx_http_sysguard_conf_t *conf);
 ngx_int_t ngx_http_sysguard_update_load(ngx_http_request_t *r,
     ngx_http_sysguard_conf_t *conf);
 ngx_int_t ngx_http_sysguard_update_mem(ngx_http_request_t *r,

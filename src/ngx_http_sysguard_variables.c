@@ -11,11 +11,16 @@
 
 static ngx_int_t ngx_http_sysguard_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_sysguard_cpu_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_sysguard_memory_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 
 
 static ngx_http_variable_t  ngx_http_sysguard_variables[] = {
+
+    { ngx_string("sysguard_cpu"), NULL, ngx_http_sysguard_cpu_variable,
+      0, NGX_HTTP_VAR_NOCACHEABLE, 0 },
 
     { ngx_string("sysguard_load"), NULL, ngx_http_sysguard_variable,
       0, NGX_HTTP_VAR_NOCACHEABLE, 0 },
@@ -115,6 +120,34 @@ ngx_http_sysguard_variable(ngx_http_request_t *r, ngx_http_variable_value_t *v,
 not_found:
 
     v->not_found = 1;
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_http_sysguard_cpu_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    u_char                     *p;
+    ngx_http_sysguard_conf_t   *conf;
+
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_sysguard_module);
+    if (ngx_http_sysguard_update_cpu(r, conf) != NGX_OK) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    p = ngx_pnalloc(r->pool, sizeof("100.00") - 1);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    v->len = ngx_sprintf(p, "%ui.%02ui", conf->sysinfo.cpu / 100,
+                         conf->sysinfo.cpu % 100) - p;
+    v->data = p;
+    v->valid = 1;
+    v->no_cacheable = 1;
+    v->not_found = 0;
     return NGX_OK;
 }
 

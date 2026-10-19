@@ -22,17 +22,29 @@ typedef struct {
 
 
 typedef struct {
-    time_t                           load_expires;
-    time_t                           mem_expires;
-    ngx_int_t                        load_status;
-    ngx_int_t                        mem_status;
-    ngx_int_t                        load;
-    ngx_uint_t                       swap;
-    size_t                           free;
-    ngx_http_sysguard_meminfo_t      meminfo;
+    uint64_t                         times[7];
+} ngx_http_sysguard_cpuinfo_t;
+
+
+typedef struct {
+    time_t                            cpu_expires;
+    ngx_int_t                         cpu_status;
+    ngx_uint_t                        cpu;
+    ngx_http_sysguard_cpuinfo_t       cpu_previous;
+    unsigned                          cpu_started:1;
+    time_t                            load_expires;
+    time_t                            mem_expires;
+    ngx_int_t                         load_status;
+    ngx_int_t                         mem_status;
+    ngx_int_t                         load;
+    ngx_uint_t                        swap;
+    size_t                            free;
+    ngx_http_sysguard_meminfo_t       meminfo;
 } ngx_http_sysguard_sysinfo_t;
 
 
+ngx_int_t ngx_http_sysguard_getcpuinfo(ngx_http_sysguard_cpuinfo_t *info,
+    ngx_log_t *log);
 ngx_int_t ngx_http_sysguard_getloadavg(ngx_int_t *load, ngx_log_t *log);
 ngx_int_t ngx_http_sysguard_getmeminfo(ngx_http_sysguard_meminfo_t *meminfo,
     ngx_log_t *log);

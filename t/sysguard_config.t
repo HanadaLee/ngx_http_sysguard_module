@@ -10,6 +10,18 @@ use Test::Nginx;
 plan 'no_plan';
 
 my @invalid = (
+    'sysguard_interval 9223372036854775807;',
+    'sysguard_cpu usage=100.01;',
+    'sysguard_cpu usage=-1;',
+    'sysguard_cpu usage=50%;',
+    'sysguard_cpu period=1;',
+    'sysguard_cpu usage=50 period=0;',
+    'sysguard_cpu usage=50 period=9223372036854775807;',
+    'sysguard_cpu usage=50 actoin=/limited;',
+    'sysguard_cpu usage=50 usage=60;',
+    'sysguard_cpu usage=50 period=1 period=2;',
+    'sysguard_cpu usage=50 action=/a action=/b;',
+    'sysguard_cpu usage=50; sysguard_cpu usage=60;',
     'sysguard_rt rt=0.1 period=0;',
     'sysguard_rt rt=0.1 method=AMM:0;',
     'sysguard_rt rt=0.1 method=WMA:0;',
@@ -18,6 +30,8 @@ my @invalid = (
     'sysguard_rt rt=0.1 method=WMA:2:3;',
     'sysguard_rt rt=0.1 actoin=/limit;',
     'sysguard_rt rt=0.1 action=;',
+    'sysguard_rt rt=0.1 action=@;',
+    'sysguard_rt rt=0.1 method=AMM:9223372036854775807;',
     'sysguard_rt rt=0.1 action=limit;',
     'sysguard_rt period=2;',
     'sysguard_rt rt=1 rt=2;',
@@ -33,6 +47,9 @@ my @invalid = (
     'sysguard_mode on;',
 );
 my @valid = (
+    'sysguard_cpu usage=0;',
+    'sysguard_cpu usage=100;',
+    'sysguard_cpu usage=50.25 period=1 action=@limited;',
     'sysguard_rt rt=0.1;',
     'sysguard_rt rt=0.1 method=AMM:1;',
     'sysguard_rt rt=0.1 method=WMA:1;',
@@ -69,7 +86,7 @@ EOF
     waitpid($pid, 0);
     is($? == 0 ? 1 : 0, $valid, $directive);
     if (!$valid) {
-        like($t->read_file('config-test.log'), qr/invalid parameter|duplicate|requires|invalid value/,
+        like($t->read_file('config-test.log'), qr/invalid parameter|duplicate|requires|invalid value|too many sysguard RT samples|sysguard_interval is too large/,
             'rejected for the directive error');
     }
 }
