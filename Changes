@@ -1,3 +1,12 @@
+0.2.0
+    * Fix default RT division by zero, sample capacity and expired-sample averages.
+    * Preserve request protection and RT ownership across internal redirects.
+    * Refresh metric variables independently and validate configuration values.
+    * Fix swap threshold scaling and validate Linux memory counters.
+    * Correct FreeBSD page units and handle optional counters on a best-effort basis.
+    * Add Tengine-compatible CPU protection with bounded Linux counter parsing.
+    * Add nginx integration tests and a four-variant GitHub Actions matrix.
+
 v0.1.0 [Thu Feb 23 2017 YoungJoo.Kim <vozltx@gmail.com>]
     * The first version.
 
