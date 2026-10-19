@@ -1,7 +1,7 @@
-
 /*
  * Copyright (C) 2010-2015 Alibaba Group Holding Limited
  * Copyright (C) YoungJoo Kim (vozlt)
+ * Copyright (C) Hanada
  */
 
 
@@ -9,97 +9,146 @@
 #include "ngx_http_sysguard_variables.h"
 
 
-static ngx_http_variable_t  ngx_http_sysguard_vars[] = {
+static ngx_int_t ngx_http_sysguard_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_sysguard_memory_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
 
-    { ngx_string("sysguard_load"), NULL,
-      ngx_http_sysguard_sysinfo_variable,
-      offsetof(ngx_http_sysguard_sysinfo_t, cached_load),
-      NGX_HTTP_VAR_NOCACHEABLE, 0 },
 
-    { ngx_string("sysguard_swapstat"), NULL,
-      ngx_http_sysguard_sysinfo_variable,
-      offsetof(ngx_http_sysguard_sysinfo_t, cached_swapstat),
-      NGX_HTTP_VAR_NOCACHEABLE, 0 },
+static ngx_http_variable_t  ngx_http_sysguard_variables[] = {
 
-    { ngx_string("sysguard_free"), NULL,
-      ngx_http_sysguard_sysinfo_variable,
-      offsetof(ngx_http_sysguard_sysinfo_t, cached_free),
-      NGX_HTTP_VAR_NOCACHEABLE, 0 },
+    { ngx_string("sysguard_load"), NULL, ngx_http_sysguard_variable,
+      0, NGX_HTTP_VAR_NOCACHEABLE, 0 },
 
-    { ngx_string("sysguard_rt"), NULL,
-      ngx_http_sysguard_sysinfo_variable,
-      offsetof(ngx_http_sysguard_sysinfo_t, cached_rt),
-      NGX_HTTP_VAR_NOCACHEABLE, 0 },
+    { ngx_string("sysguard_swapstat"), NULL, ngx_http_sysguard_variable,
+      1, NGX_HTTP_VAR_NOCACHEABLE, 0 },
+
+    { ngx_string("sysguard_free"), NULL, ngx_http_sysguard_variable,
+      2, NGX_HTTP_VAR_NOCACHEABLE, 0 },
+
+    { ngx_string("sysguard_rt"), NULL, ngx_http_sysguard_variable,
+      3, NGX_HTTP_VAR_NOCACHEABLE, 0 },
 
     { ngx_string("sysguard_meminfo_totalram"), NULL,
-      ngx_http_sysguard_sysinfo_variable,
-      offsetof(ngx_http_sysguard_sysinfo_t, meminfo)
-      + offsetof(ngx_http_sysguard_meminfo_t, totalram),
+      ngx_http_sysguard_memory_variable,
+      offsetof(ngx_http_sysguard_meminfo_t, totalram),
       NGX_HTTP_VAR_NOCACHEABLE, 0 },
 
     { ngx_string("sysguard_meminfo_freeram"), NULL,
-      ngx_http_sysguard_sysinfo_variable,
-      offsetof(ngx_http_sysguard_sysinfo_t, meminfo)
-      + offsetof(ngx_http_sysguard_meminfo_t, freeram),
+      ngx_http_sysguard_memory_variable,
+      offsetof(ngx_http_sysguard_meminfo_t, freeram),
       NGX_HTTP_VAR_NOCACHEABLE, 0 },
 
     { ngx_string("sysguard_meminfo_bufferram"), NULL,
-      ngx_http_sysguard_sysinfo_variable,
-      offsetof(ngx_http_sysguard_sysinfo_t, meminfo)
-      + offsetof(ngx_http_sysguard_meminfo_t, bufferram),
+      ngx_http_sysguard_memory_variable,
+      offsetof(ngx_http_sysguard_meminfo_t, bufferram),
       NGX_HTTP_VAR_NOCACHEABLE, 0 },
 
     { ngx_string("sysguard_meminfo_cachedram"), NULL,
-      ngx_http_sysguard_sysinfo_variable,
-      offsetof(ngx_http_sysguard_sysinfo_t, meminfo)
-      + offsetof(ngx_http_sysguard_meminfo_t, cachedram),
+      ngx_http_sysguard_memory_variable,
+      offsetof(ngx_http_sysguard_meminfo_t, cachedram),
       NGX_HTTP_VAR_NOCACHEABLE, 0 },
 
     { ngx_string("sysguard_meminfo_totalswap"), NULL,
-      ngx_http_sysguard_sysinfo_variable,
-      offsetof(ngx_http_sysguard_sysinfo_t, meminfo)
-      + offsetof(ngx_http_sysguard_meminfo_t, totalswap),
+      ngx_http_sysguard_memory_variable,
+      offsetof(ngx_http_sysguard_meminfo_t, totalswap),
       NGX_HTTP_VAR_NOCACHEABLE, 0 },
 
     { ngx_string("sysguard_meminfo_freeswap"), NULL,
-      ngx_http_sysguard_sysinfo_variable,
-      offsetof(ngx_http_sysguard_sysinfo_t, meminfo)
-      + offsetof(ngx_http_sysguard_meminfo_t, freeswap),
+      ngx_http_sysguard_memory_variable,
+      offsetof(ngx_http_sysguard_meminfo_t, freeswap),
       NGX_HTTP_VAR_NOCACHEABLE, 0 },
 
-    { ngx_null_string, NULL, NULL, 0, 0, 0 }
+      ngx_http_null_variable
 };
 
-    
-ngx_int_t
-ngx_http_sysguard_sysinfo_variable(ngx_http_request_t *r,
-    ngx_http_variable_value_t *v, uintptr_t data)
+
+static ngx_int_t
+ngx_http_sysguard_variable(ngx_http_request_t *r, ngx_http_variable_value_t *v,
+    uintptr_t data)
 {
+    u_char                     *p;
+    size_t                      value;
+    ngx_http_sysguard_conf_t   *conf;
 
-    u_char                    *p;
-    ngx_http_sysguard_conf_t  *glcf;
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_sysguard_module);
 
-    glcf = ngx_http_get_module_loc_conf(r, ngx_http_sysguard_module);
+    switch (data) {
+    case 0:
+        if (ngx_http_sysguard_update_load(r, conf) != NGX_OK) {
+            goto not_found;
+        }
 
-    p = ngx_pnalloc(r->pool, NGX_INT_T_LEN);
-    if (p == NULL) {
-        goto not_found;
+        value = conf->sysinfo.load;
+        break;
+
+    case 1:
+    case 2:
+        if (ngx_http_sysguard_update_mem(r, conf) != NGX_OK) {
+            goto not_found;
+        }
+
+        if (data == 1 && !conf->sysinfo.meminfo.swap_available) {
+            goto not_found;
+        }
+
+        value = (data == 1) ? conf->sysinfo.swap / 100 : conf->sysinfo.free;
+        break;
+
+    default:
+        value = ngx_http_sysguard_response_time(conf);
+        break;
     }
 
-    v->len = ngx_sprintf(p, "%i", *((ngx_int_t *) ((char *) &glcf->sysinfo + data))) - p;
-    v->valid = 1;
-    v->no_cacheable = 0;
-    v->not_found = 0;
-    v->data = p;
+    p = ngx_pnalloc(r->pool, NGX_SIZE_T_LEN);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
 
-    goto done;
+    v->len = ngx_sprintf(p, "%uz", value) - p;
+    v->data = p;
+    v->valid = 1;
+    v->no_cacheable = 1;
+    v->not_found = 0;
+    return NGX_OK;
 
 not_found:
 
     v->not_found = 1;
+    return NGX_OK;
+}
 
-done:
 
+static ngx_int_t
+ngx_http_sysguard_memory_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    u_char                     *p;
+    size_t                      value;
+    ngx_http_sysguard_conf_t   *conf;
+
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_sysguard_module);
+
+    if (ngx_http_sysguard_update_mem(r, conf) != NGX_OK
+        || (!conf->sysinfo.meminfo.swap_available
+            && (data == offsetof(ngx_http_sysguard_meminfo_t, totalswap)
+                || data == offsetof(ngx_http_sysguard_meminfo_t, freeswap))))
+    {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    value = *(size_t *) ((u_char *) &conf->sysinfo.meminfo + data);
+    p = ngx_pnalloc(r->pool, NGX_SIZE_T_LEN);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    v->len = ngx_sprintf(p, "%uz", value) - p;
+    v->data = p;
+    v->valid = 1;
+    v->no_cacheable = 1;
+    v->not_found = 0;
     return NGX_OK;
 }
 
@@ -109,7 +158,7 @@ ngx_http_sysguard_add_variables(ngx_conf_t *cf)
 {
     ngx_http_variable_t  *var, *v;
 
-    for (v = ngx_http_sysguard_vars; v->name.len; v++) {
+    for (v = ngx_http_sysguard_variables; v->name.len; v++) {
         var = ngx_http_add_variable(cf, &v->name, v->flags);
         if (var == NULL) {
             return NGX_ERROR;
@@ -121,5 +170,3 @@ ngx_http_sysguard_add_variables(ngx_conf_t *cf)
 
     return NGX_OK;
 }
-
-/* vi:set ft=c ts=4 sw=4 et fdm=marker: */

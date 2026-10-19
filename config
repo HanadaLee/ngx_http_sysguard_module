@@ -52,22 +52,11 @@ ngx_feature_test="double loadavg[1];
 ngx_feature="/proc/meminfo"
 ngx_feature_name="NGX_HAVE_PROC_MEMINFO"
 ngx_feature_run=yes
-ngx_feature_incs="#include <fcntl.h>"
+ngx_feature_incs="#include <fcntl.h>
+                  #include <unistd.h>"
 ngx_feature_path=
 ngx_feature_libs=
-ngx_feature_test='int fd;
-                  if (open("/proc/meminfo", O_RDONLY) == -1) return 1;'
+ngx_feature_test='int fd = open("/proc/meminfo", O_RDONLY);
+                  if (fd == -1) return 1;
+                  close(fd);'
 . auto/feature
-
-ngx_feature="vm.stats"
-ngx_feature_name="NGX_HAVE_VM_STATS"
-ngx_feature_run=yes
-ngx_feature_incs="#include <sys/sysctl.h>"
-ngx_feature_path=
-ngx_feature_libs=
-ngx_feature_test='size_t vl;
-                  size_t sz = sizeof(vl);
-                  if (sysctlbyname("vm.stats.vm.v_free_count", &vl, &sz, NULL, 0) == -1) return 1;'
-. auto/feature
-
-# vi:set ft=sh ts=4 sw=4 et fdm=marker:

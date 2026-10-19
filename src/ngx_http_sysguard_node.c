@@ -1,7 +1,7 @@
-
 /*
  * Copyright (C) 2010-2015 Alibaba Group Holding Limited
  * Copyright (C) YoungJoo Kim (vozlt)
+ * Copyright (C) Hanada
  */
 
 
@@ -9,118 +9,53 @@
 
 
 void
-ngx_http_sysguard_node_time_ring_zero(
-    ngx_http_sysguard_node_time_ring_t *q)
+ngx_http_sysguard_rt_add(ngx_http_sysguard_rt_t *rt, ngx_msec_t elapsed)
 {
-    ngx_memzero(q, sizeof(ngx_http_sysguard_node_time_ring_t));
-}
+    ngx_uint_t  i;
 
+    i = (rt->first + rt->count) % rt->capacity;
 
-void
-ngx_http_sysguard_node_time_ring_init(
-    ngx_http_sysguard_node_time_ring_t *q,
-    size_t len)
-{
-    ngx_http_sysguard_node_time_ring_zero(q);
-    q->rear = len - 1;
-    q->len = len;
-}
+    if (rt->count == rt->capacity) {
+        rt->first = (rt->first + 1) % rt->capacity;
 
-
-ngx_int_t
-ngx_http_sysguard_node_time_ring_push(
-    ngx_http_sysguard_node_time_ring_t *q,
-    ngx_msec_int_t x)
-{
-    if ((q->rear + 1) % q->len == q->front) {
-        return NGX_ERROR;
+    } else {
+        rt->count++;
     }
 
-    q->times[q->rear].time = ngx_current_msec;
-    q->times[q->rear].msec = x;
-    q->rear = (q->rear + 1) % q->len;
-
-    return NGX_OK;
-}
-
-
-ngx_int_t
-ngx_http_sysguard_node_time_ring_pop(
-    ngx_http_sysguard_node_time_ring_t *q,
-    ngx_http_sysguard_node_time_t *x)
-{
-    if (q->front == q->rear) {
-        return NGX_ERROR;
-    }
-
-    *x = q->times[q->front];
-    q->front = (q->front + 1) % q->len;
-
-    return NGX_OK;
-}
-
-
-void
-ngx_http_sysguard_node_time_ring_insert(
-    ngx_http_sysguard_node_time_ring_t *q,
-    ngx_msec_int_t x)
-{
-    ngx_int_t                      rc;
-    ngx_http_sysguard_node_time_t  rx;
-    rc = ngx_http_sysguard_node_time_ring_pop(q, &rx)
-         | ngx_http_sysguard_node_time_ring_push(q, x);
-
-    if (rc != NGX_OK) {
-        ngx_http_sysguard_node_time_ring_init(q, q->len);
-    }
+    rt->samples[i].time = ngx_current_msec;
+    rt->samples[i].elapsed = elapsed;
 }
 
 
 ngx_msec_t
-ngx_http_sysguard_node_time_ring_average_amm(
-    ngx_http_request_t *r,
-    ngx_http_sysguard_node_time_ring_t *q)
+ngx_http_sysguard_rt_average(ngx_http_sysguard_rt_t *rt, ngx_msec_t period,
+    ngx_uint_t method)
 {
-    ngx_int_t                  i, j, k;
-    ngx_http_sysguard_conf_t  *glcf;
+    double          total, weight, weights;
+    ngx_uint_t      i, n;
+    ngx_msec_int_t  age;
 
-    glcf = ngx_http_get_module_loc_conf(r, ngx_http_sysguard_module);
+    while (rt->count) {
+        age = (ngx_msec_int_t) (ngx_current_msec
+                               - rt->samples[rt->first].time);
 
-    for (i = q->front, j = 1, k = 0; i != q->rear; i = (i + 1) % q->len, j++) {
-        if (q->times[i].time + (glcf->rt_period * 1000) > ngx_current_msec) {
-            k += (ngx_int_t) q->times[i].msec;
+        if (age >= 0 && (ngx_msec_t) age < period) {
+            break;
         }
+
+        rt->first = (rt->first + 1) % rt->capacity;
+        rt->count--;
     }
 
-    if (j != q->len) {
-        ngx_http_sysguard_node_time_ring_init(q, q->len);
+    total = 0;
+    weights = 0;
+
+    for (n = 0; n < rt->count; n++) {
+        i = (rt->first + n) % rt->capacity;
+        weight = (method == NGX_HTTP_SYSGUARD_AVERAGE_WMA) ? n + 1 : 1;
+        total += (double) rt->samples[i].elapsed * weight;
+        weights += weight;
     }
 
-    return (ngx_msec_t) (k / (q->len - 1));
+    return weights ? (ngx_msec_t) (total / weights) : 0;
 }
-
-
-ngx_msec_t
-ngx_http_sysguard_node_time_ring_average_wma(
-    ngx_http_request_t *r,
-    ngx_http_sysguard_node_time_ring_t *q)
-{
-    ngx_int_t                  i, j, k;
-    ngx_http_sysguard_conf_t  *glcf;
-
-    glcf = ngx_http_get_module_loc_conf(r, ngx_http_sysguard_module);
-
-    for (i = q->front, j = 1, k = 0; i != q->rear; i = (i + 1) % q->len, j++) {
-        if (q->times[i].time + (glcf->rt_period * 1000) > ngx_current_msec) {
-            k += (ngx_int_t) q->times[i].msec * j;
-        }
-    }
-
-    if (j != q->len) {
-        ngx_http_sysguard_node_time_ring_init(q, q->len);
-    }
-
-    return (ngx_msec_t) (k / (ngx_int_t) ngx_http_sysguard_triangle((q->len - 1)));
-}
-
-/* vi:set ft=c ts=4 sw=4 et fdm=marker: */

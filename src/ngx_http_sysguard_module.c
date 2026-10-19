@@ -1,6 +1,7 @@
 /*
  * Copyright (C) 2010-2015 Alibaba Group Holding Limited
  * Copyright (C) YoungJoo Kim (vozlt)
+ * Copyright (C) Hanada
  */
 
 
@@ -8,6 +9,19 @@
 #include "ngx_http_sysguard_variables.h"
 
 
+typedef struct {
+    ngx_flag_t                       rt_used;
+} ngx_http_sysguard_main_conf_t;
+
+
+typedef struct {
+    ngx_http_sysguard_conf_t         *conf;
+    unsigned                          checked:1;
+    unsigned                          rejected:1;
+} ngx_http_sysguard_ctx_t;
+
+
+static void *ngx_http_sysguard_create_main_conf(ngx_conf_t *cf);
 static void *ngx_http_sysguard_create_conf(ngx_conf_t *cf);
 static char *ngx_http_sysguard_merge_conf(ngx_conf_t *cf, void *parent,
     void *child);
@@ -15,9 +29,11 @@ static char *ngx_http_sysguard_load(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_sysguard_mem(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
-static char *ngx_http_sysguard_rt(ngx_conf_t *cf,
-    ngx_command_t *cmd, void *conf);
+static char *ngx_http_sysguard_rt(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static ngx_int_t ngx_http_sysguard_action(ngx_str_t *value, ngx_str_t *action);
 static ngx_int_t ngx_http_sysguard_init(ngx_conf_t *cf);
+static void ngx_http_sysguard_cleanup(void *data);
 
 
 static ngx_conf_enum_t  ngx_http_sysguard_log_levels[] = {
@@ -46,7 +62,7 @@ static ngx_command_t  ngx_http_sysguard_commands[] = {
       NULL },
 
     { ngx_string("sysguard_mode"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_enum_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_sysguard_conf_t, mode),
@@ -95,7 +111,7 @@ static ngx_http_module_t  ngx_http_sysguard_module_ctx = {
     ngx_http_sysguard_add_variables,        /* preconfiguration */
     ngx_http_sysguard_init,                 /* postconfiguration */
 
-    NULL,                                   /* create main configuration */
+    ngx_http_sysguard_create_main_conf,     /* create main configuration */
     NULL,                                   /* init main configuration */
 
     NULL,                                   /* create server configuration */
@@ -122,334 +138,275 @@ ngx_module_t  ngx_http_sysguard_module = {
 };
 
 
-static ngx_int_t
-ngx_http_sysguard_update_load(ngx_http_request_t *r, time_t exptime)
+ngx_int_t
+ngx_http_sysguard_update_load(ngx_http_request_t *r,
+    ngx_http_sysguard_conf_t *conf)
 {
-    ngx_int_t                  load, rc;
-    ngx_http_sysguard_conf_t  *glcf;
+    ngx_http_sysguard_sysinfo_t  *info;
 
-    glcf = ngx_http_get_module_loc_conf(r, ngx_http_sysguard_module);
+    info = &conf->sysinfo;
 
-    glcf->sysinfo.cached_load_exptime = ngx_time() + exptime;
+    if (info->load_expires <= ngx_time()) {
+        info->load_expires = ngx_time() + conf->interval;
+        info->load_status = ngx_http_sysguard_getloadavg(&info->load,
+                                                        r->connection->log);
+    }
 
-    rc = ngx_http_sysguard_getloadavg(&load, 1, r->connection->log);
-    if (rc == NGX_ERROR) {
-        glcf->sysinfo.cached_load = 0;
+    return info->load_status;
+}
 
+
+ngx_int_t
+ngx_http_sysguard_update_mem(ngx_http_request_t *r,
+    ngx_http_sysguard_conf_t *conf)
+{
+    ngx_http_sysguard_meminfo_t  *mem;
+    ngx_http_sysguard_sysinfo_t  *info;
+
+    info = &conf->sysinfo;
+
+    if (info->mem_expires > ngx_time()) {
+        return info->mem_status;
+    }
+
+    info->mem_expires = ngx_time() + conf->interval;
+    mem = &info->meminfo;
+    info->mem_status = ngx_http_sysguard_getmeminfo(mem, r->connection->log);
+
+    if (info->mem_status != NGX_OK) {
         return NGX_ERROR;
     }
 
-    glcf->sysinfo.cached_load = load;
+    /* Fixed point, with two decimal places, matching swapratio=. */
+    info->swap = mem->totalswap
+                 ? (ngx_uint_t) ((long double) (mem->totalswap - mem->freeswap)
+                                  * 10000 / mem->totalswap)
+                 : 0;
+    info->free = mem->freeram + mem->cachedram + mem->bufferram;
 
     return NGX_OK;
 }
 
 
-static ngx_int_t
-ngx_http_sysguard_update_mem(ngx_http_request_t *r, time_t exptime)
+ngx_msec_t
+ngx_http_sysguard_response_time(ngx_http_sysguard_conf_t *conf)
 {
-    ngx_int_t                     rc;
-    ngx_http_sysguard_meminfo_t   m;
-    ngx_http_sysguard_conf_t     *glcf;
+    return ngx_http_sysguard_rt_average(&conf->request_times,
+                          (ngx_msec_t) conf->rt_period * 1000, conf->rt_method);
+}
 
-    glcf = ngx_http_get_module_loc_conf(r, ngx_http_sysguard_module);
 
-    glcf->sysinfo.cached_mem_exptime = ngx_time() + exptime;
+static ngx_http_sysguard_ctx_t *
+ngx_http_sysguard_get_ctx(ngx_http_request_t *r, ngx_flag_t create)
+{
+    ngx_pool_cleanup_t       *cln;
+    ngx_http_sysguard_ctx_t  *ctx;
 
-    rc = ngx_http_sysguard_getmeminfo(&m, r->connection->log);
-    if (rc == NGX_ERROR) {
-        glcf->sysinfo.cached_swapstat = 0;
-        glcf->sysinfo.cached_free = NGX_CONF_UNSET_SIZE;
-
-        return NGX_ERROR;
+    ctx = ngx_http_get_module_ctx(r->main, ngx_http_sysguard_module);
+    if (ctx != NULL) {
+        return ctx;
     }
 
-    glcf->sysinfo.meminfo = m;
-    glcf->sysinfo.cached_swapstat = (m.totalswap == 0)
-                                    ? 0
-                                    : (m.totalswap - m.freeswap) * 100 / m.totalswap;
-    glcf->sysinfo.cached_free = m.freeram + m.cachedram + m.bufferram;
+    /* Internal redirects clear module contexts, but keep the request pool. */
+    for (cln = r->main->pool->cleanup; cln; cln = cln->next) {
+        if (cln->handler == ngx_http_sysguard_cleanup) {
+            ngx_http_set_ctx(r->main, cln->data, ngx_http_sysguard_module);
+            return cln->data;
+        }
+    }
 
-    return NGX_OK;
+    if (!create) {
+        return NULL;
+    }
+
+    cln = ngx_pool_cleanup_add(r->main->pool, sizeof(ngx_http_sysguard_ctx_t));
+    if (cln == NULL) {
+        return NULL;
+    }
+
+    ctx = cln->data;
+    ngx_memzero(ctx, sizeof(ngx_http_sysguard_ctx_t));
+    cln->handler = ngx_http_sysguard_cleanup;
+    ngx_http_set_ctx(r->main, ctx, ngx_http_sysguard_module);
+
+    return ctx;
+}
+
+
+static void
+ngx_http_sysguard_cleanup(void *data)
+{
+    /* The cleanup entry anchors state across internal redirects. */
 }
 
 
 static ngx_int_t
-ngx_http_sysguard_update_rt(ngx_http_request_t *r, time_t exptime)
+ngx_http_sysguard_test(ngx_http_request_t *r, ngx_http_sysguard_conf_t *conf,
+    ngx_uint_t metric, double *value, double *limit, ngx_str_t **action)
 {
-    ngx_http_sysguard_conf_t  *glcf;
+    switch (metric) {
 
-    glcf = ngx_http_get_module_loc_conf(r, ngx_http_sysguard_module);
+    case 0:
+        if (conf->load == NGX_CONF_UNSET) {
+            return NGX_DECLINED;
+        }
 
-    glcf->sysinfo.cached_rt_exptime = ngx_time() + exptime;
+        *action = &conf->load_action;
+        if (ngx_http_sysguard_update_load(r, conf) != NGX_OK) {
+            return NGX_DECLINED;
+        }
 
-    glcf->sysinfo.cached_rt = (glcf->rt_method == NGX_HTTP_SYSGUARD_AVERAGE_AMM)
-                                        ? ngx_http_sysguard_node_time_ring_average_amm(
-                                              r, &glcf->request_times)
-                                        : ngx_http_sysguard_node_time_ring_average_wma(
-                                              r, &glcf->request_times);
+        *value = conf->sysinfo.load / 1000.0;
+        *limit = conf->load / 1000.0;
+        break;
 
-    return NGX_OK;
-}
+    case 1:
+        if (conf->swap == NGX_CONF_UNSET) {
+            return NGX_DECLINED;
+        }
 
+        *action = &conf->swap_action;
+        if (ngx_http_sysguard_update_mem(r, conf) != NGX_OK
+            || !conf->sysinfo.meminfo.swap_available)
+        {
+            return NGX_DECLINED;
+        }
 
-void
-ngx_http_sysguard_update_rt_node(ngx_http_request_t *r)
-{
-    ngx_http_sysguard_conf_t  *glcf;
+        *value = conf->sysinfo.swap / 100.0;
+        *limit = conf->swap / 100.0;
+        break;
 
-    glcf = ngx_http_get_module_loc_conf(r, ngx_http_sysguard_module);
+    case 2:
+        if (conf->free == NGX_CONF_UNSET_SIZE) {
+            return NGX_DECLINED;
+        }
 
-    if (!glcf->enable) {
-        return;
+        *action = &conf->free_action;
+        if (ngx_http_sysguard_update_mem(r, conf) != NGX_OK) {
+            return NGX_DECLINED;
+        }
+
+        *value = conf->sysinfo.free;
+        *limit = conf->free;
+        return *value < *limit ? NGX_OK : NGX_DECLINED;
+
+    default:
+        if (conf->rt == NGX_CONF_UNSET) {
+            return NGX_DECLINED;
+        }
+
+        *action = &conf->rt_action;
+        *value = ngx_http_sysguard_response_time(conf) / 1000.0;
+        *limit = conf->rt / 1000.0;
+        break;
     }
 
-    if (glcf->rt == NGX_CONF_UNSET) {
-        return;
-    }
-
-    ngx_http_sysguard_node_time_ring_insert(&glcf->request_times,
-                                            ngx_http_sysguard_request_time(r));
-}
-
-
-static ngx_int_t
-ngx_http_sysguard_do_redirect(ngx_http_request_t *r, ngx_str_t *path)
-{
-    if (path->len == 0) {
-        return NGX_HTTP_SERVICE_UNAVAILABLE;
-    } else if (path->data[0] == '@') {
-        (void) ngx_http_named_location(r, path);
-    } else {
-        (void) ngx_http_internal_redirect(r, path, &r->args);
-    }
-
-    ngx_http_finalize_request(r, NGX_DONE);
-
-    return NGX_DONE;
+    return *value > *limit ? NGX_OK : NGX_DECLINED;
 }
 
 
 static ngx_int_t
 ngx_http_sysguard_handler(ngx_http_request_t *r)
 {
-    ngx_int_t                  load_log = 0, swap_log = 0,
-                               free_log = 0, rt_log = 0;
-    ngx_str_t                 *action = NULL;
-    ngx_http_sysguard_conf_t  *glcf;
+    double                          value, limit, last_value, last_limit;
+    ngx_int_t                       rc;
+    ngx_uint_t                      i, last;
+    ngx_str_t                      *action, *path;
+    ngx_http_sysguard_ctx_t         *ctx;
+    ngx_http_sysguard_conf_t        *conf;
+    ngx_http_sysguard_main_conf_t   *mcf;
+    static char                    *names[] = { "load", "swap", "free", "rt" };
 
-
-    /*
-     * About ignoring the subrequests:
-     * 
-     *   The below is not guaranteed but it works well in general.
-     *
-     *   if (r->main->count != 1) {
-     *     return NGX_DECLINED;
-     *   }
-     */
-
-    glcf = ngx_http_get_module_loc_conf(r, ngx_http_sysguard_module);
-    
-    if (!glcf->enable) {
+    if (r != r->main) {
         return NGX_DECLINED;
     }
 
-    /* load */
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_sysguard_module);
+    mcf = ngx_http_get_module_main_conf(r, ngx_http_sysguard_module);
 
-    if (glcf->load != NGX_CONF_UNSET) {
+    if (!conf->enable && !mcf->rt_used) {
+        return NGX_DECLINED;
+    }
 
-        if (glcf->sysinfo.cached_load_exptime < ngx_time()) {
-            ngx_http_sysguard_update_load(r, glcf->interval);
+    ctx = ngx_http_sysguard_get_ctx(r, 1);
+    if (ctx == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    if (ctx->checked) {
+        return NGX_DECLINED;
+    }
+
+    if (ctx->conf == NULL) {
+        ctx->conf = conf;
+    }
+
+    if (!conf->enable) {
+        return NGX_DECLINED;
+    }
+
+    ctx->checked = 1;
+
+    path = NULL;
+    last = 0;
+    last_value = 0;
+    last_limit = 0;
+
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        action = NULL;
+        rc = ngx_http_sysguard_test(r, conf, i, &value, &limit, &action);
+
+        if (action == NULL) {
+            continue;
         }
 
-        ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "http sysguard handler load: %1.3f %1.3f %V %V",
-                       glcf->sysinfo.cached_load * 1.0 / 1000,
-                       glcf->load * 1.0 / 1000,
-                       &r->uri,
-                       &glcf->load_action);
-
-        if (glcf->sysinfo.cached_load > glcf->load) {
-
-            if (glcf->mode == NGX_HTTP_SYSGUARD_MODE_OR) {
-
-                ngx_log_error(glcf->log_level, r->connection->log, 0,
-                              "sysguard load limited, current:%1.3f conf:%1.3f",
-                              glcf->sysinfo.cached_load * 1.0 / 1000,
-                              glcf->load * 1.0 / 1000);
-
-                return ngx_http_sysguard_do_redirect(r, &glcf->load_action);
-            } else {
-                action = &glcf->load_action;
-                load_log = 1;
+        if (rc != NGX_OK) {
+            if (conf->mode == NGX_HTTP_SYSGUARD_MODE_AND) {
+                return NGX_DECLINED;
             }
-        } else {
-            if (glcf->mode == NGX_HTTP_SYSGUARD_MODE_AND) {
-                goto out;
-            }
+
+            continue;
+        }
+
+        path = action;
+        last = i;
+        last_value = value;
+        last_limit = limit;
+
+        if (conf->mode == NGX_HTTP_SYSGUARD_MODE_OR) {
+            break;
         }
     }
 
-    /* swap */
-
-    if (glcf->swap != NGX_CONF_UNSET) {
-
-        if (glcf->sysinfo.cached_mem_exptime < ngx_time()) {
-            ngx_http_sysguard_update_mem(r, glcf->interval);
-        }
-
-        ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "http sysguard handler swap: %i %i %V %V",
-                       glcf->sysinfo.cached_swapstat,
-                       glcf->swap,
-                       &r->uri,
-                       &glcf->swap_action);
-
-        if (glcf->sysinfo.cached_swapstat > glcf->swap) {
-
-            if (glcf->mode == NGX_HTTP_SYSGUARD_MODE_OR) {
-
-                ngx_log_error(glcf->log_level, r->connection->log, 0,
-                              "sysguard swap limited, current:%i conf:%i",
-                              glcf->sysinfo.cached_swapstat,
-                              glcf->swap);
-
-                return ngx_http_sysguard_do_redirect(r, &glcf->swap_action);
-            } else {
-                action = &glcf->swap_action;
-                swap_log = 1;
-            }
-        } else {
-            if (glcf->mode == NGX_HTTP_SYSGUARD_MODE_AND) {
-                goto out;
-            }
-        }
+    if (path == NULL) {
+        return NGX_DECLINED;
     }
 
-    /* mem free */
+    ctx->rejected = 1;
+    ngx_log_error(conf->log_level, r->connection->log, 0,
+                  "sysguard %s limited, current:%.3f conf:%.3f",
+                  names[last], last_value, last_limit);
 
-    if (glcf->free != NGX_CONF_UNSET_SIZE) {
-
-        if (glcf->sysinfo.cached_mem_exptime < ngx_time()) {
-            ngx_http_sysguard_update_mem(r, glcf->interval);
-        }
-
-        if (glcf->sysinfo.cached_free != NGX_CONF_UNSET_SIZE) {
-
-            ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "http sysguard handler free: %uz %uz %V %V",
-                           glcf->sysinfo.cached_free,
-                           glcf->free,
-                           &r->uri,
-                           &glcf->free_action);
-
-            if (glcf->sysinfo.cached_free < glcf->free) {
-
-                if (glcf->mode == NGX_HTTP_SYSGUARD_MODE_OR) {
-
-                    ngx_log_error(glcf->log_level, r->connection->log, 0,
-                                  "sysguard free limited, "
-                                  "current:%uzM conf:%uzM",
-                                  glcf->sysinfo.cached_free / 1024 / 1024,
-                                  glcf->free / 1024 / 1024);
-
-                    return ngx_http_sysguard_do_redirect(r, &glcf->free_action);
-                } else {
-                    action = &glcf->free_action;
-                    free_log = 1;
-                }
-            } else {
-                if (glcf->mode == NGX_HTTP_SYSGUARD_MODE_AND) {
-                    goto out;
-                }
-            }
-        }
+    if (path->len == 0) {
+        return NGX_HTTP_SERVICE_UNAVAILABLE;
     }
 
-    /* response time */
+    if (path->data[0] == '@') {
+        (void) ngx_http_named_location(r, path);
 
-    if (glcf->rt != NGX_CONF_UNSET) {
-
-        if (glcf->sysinfo.cached_rt_exptime < ngx_time()) {
-            ngx_http_sysguard_update_rt(r, glcf->interval);
-        }
-
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "http sysguard handler rt: %1.3f %1.3f",
-                       glcf->sysinfo.cached_rt * 1.0 / 1000,
-                       glcf->rt * 1.0 / 1000);
-
-        if (glcf->sysinfo.cached_rt > glcf->rt) {
-
-            if (glcf->mode == NGX_HTTP_SYSGUARD_MODE_OR) {
-
-                ngx_log_error(glcf->log_level, r->connection->log, 0,
-                              "sysguard rt limited, current:%1.3f conf:%1.3f",
-                              glcf->sysinfo.cached_rt * 1.0 / 1000,
-                              glcf->rt * 1.0 / 1000);
-
-                return ngx_http_sysguard_do_redirect(r, &glcf->rt_action);
-            } else {
-                action = &glcf->rt_action;
-                rt_log = 1;
-            }
-        } else {
-            if (glcf->mode == NGX_HTTP_SYSGUARD_MODE_AND) {
-                goto out;
-            }
-        }
+    } else {
+        (void) ngx_http_internal_redirect(r, path, &r->args);
     }
 
-    if (glcf->mode == NGX_HTTP_SYSGUARD_MODE_AND && action) {
-
-        if (load_log) {
-            ngx_log_error(glcf->log_level, r->connection->log, 0,
-                          "sysguard load limited, current:%1.3f conf:%1.3f",
-                          glcf->sysinfo.cached_load * 1.0 / 1000,
-                          glcf->load * 1.0 / 1000);
-        }
-
-        if (swap_log) {
-            ngx_log_error(glcf->log_level, r->connection->log, 0,
-                          "sysguard swap limited, current:%i conf:%i",
-                          glcf->sysinfo.cached_swapstat,
-                          glcf->swap);
-        }
-
-        if (free_log) {
-            ngx_log_error(glcf->log_level, r->connection->log, 0,
-                          "sysguard free limited, current:%uzM conf:%uzM",
-                          glcf->sysinfo.cached_free / 1024 / 1024,
-                          glcf->free / 1024 / 1024);
-        }
-
-        if (rt_log) {
-            ngx_log_error(glcf->log_level, r->connection->log, 0,
-                          "sysguard rt limited, current:%1.3f conf:%1.3f",
-                          glcf->sysinfo.cached_rt * 1.0 / 1000,
-                          glcf->rt * 1.0 / 1000);
-        }
-
-        return ngx_http_sysguard_do_redirect(r, action);
-    }
-
-out:
-    return NGX_DECLINED;
+    ngx_http_finalize_request(r, NGX_DONE);
+    return NGX_DONE;
 }
 
 
-ngx_msec_int_t
-ngx_http_sysguard_request_time(ngx_http_request_t *r)
+static void *
+ngx_http_sysguard_create_main_conf(ngx_conf_t *cf)
 {
-    ngx_time_t      *tp;
-    ngx_msec_int_t   ms;
-
-    tp = ngx_timeofday();
-
-    ms = (ngx_msec_int_t)
-             ((tp->sec - r->start_sec) * 1000 + (tp->msec - r->start_msec));
-    return ngx_max(ms, 0);
+    return ngx_pcalloc(cf->pool, sizeof(ngx_http_sysguard_main_conf_t));
 }
 
 
@@ -460,17 +417,8 @@ ngx_http_sysguard_create_conf(ngx_conf_t *cf)
 
     conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_sysguard_conf_t));
     if (conf == NULL) {
-        return NGX_CONF_ERROR;
+        return NULL;
     }
-
-    /*
-     * set by ngx_pcalloc():
-     *
-     *     conf->load_action = {0, NULL};
-     *     conf->swap_action = {0, NULL};
-     *     conf->rt_action = {0, NULL};
-     *     conf->ring = NULL;
-     */
 
     conf->enable = NGX_CONF_UNSET;
     conf->load = NGX_CONF_UNSET;
@@ -491,113 +439,115 @@ ngx_http_sysguard_create_conf(ngx_conf_t *cf)
 static char *
 ngx_http_sysguard_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 {
-    ngx_http_sysguard_conf_t  *prev = parent;
-    ngx_http_sysguard_conf_t  *conf = child;
+    ngx_http_sysguard_conf_t *prev = parent;
+    ngx_http_sysguard_conf_t *conf = child;
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
-
     ngx_conf_merge_str_value(conf->load_action, prev->load_action, "");
     ngx_conf_merge_str_value(conf->swap_action, prev->swap_action, "");
     ngx_conf_merge_str_value(conf->free_action, prev->free_action, "");
     ngx_conf_merge_str_value(conf->rt_action, prev->rt_action, "");
-
     ngx_conf_merge_value(conf->load, prev->load, NGX_CONF_UNSET);
     ngx_conf_merge_value(conf->swap, prev->swap, NGX_CONF_UNSET);
     ngx_conf_merge_size_value(conf->free, prev->free, NGX_CONF_UNSET_SIZE);
     ngx_conf_merge_value(conf->rt, prev->rt, NGX_CONF_UNSET);
-
     ngx_conf_merge_value(conf->rt_period, prev->rt_period, 1);
-    ngx_conf_merge_value(conf->rt_number, prev->rt_number, conf->rt_period);
-    ngx_conf_merge_value(conf->rt_method, prev->rt_method, NGX_HTTP_SYSGUARD_AVERAGE_AMM);
-
+    ngx_conf_merge_value(conf->rt_number, prev->rt_number, NGX_CONF_UNSET);
+    ngx_conf_merge_value(conf->rt_method, prev->rt_method,
+                         NGX_HTTP_SYSGUARD_AVERAGE_AMM);
     ngx_conf_merge_value(conf->interval, prev->interval, 1);
     ngx_conf_merge_uint_value(conf->log_level, prev->log_level, NGX_LOG_ERR);
-    ngx_conf_merge_uint_value(conf->mode, prev->mode, NGX_HTTP_SYSGUARD_MODE_OR);
+    ngx_conf_merge_uint_value(conf->mode, prev->mode,
+                              NGX_HTTP_SYSGUARD_MODE_OR);
 
-    ngx_memzero(&conf->sysinfo, sizeof(conf->sysinfo));
+    conf->request_times.capacity = (conf->rt_number == NGX_CONF_UNSET)
+                                  ? conf->rt_period : conf->rt_number;
 
-    if (conf->rt != NGX_CONF_UNSET) {
-        ngx_http_sysguard_node_time_ring_init(&conf->request_times, conf->rt_number);
+    if (conf->request_times.capacity
+        > NGX_MAX_SIZE_T_VALUE / sizeof(ngx_http_sysguard_sample_t))
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "too many sysguard RT samples");
+        return NGX_CONF_ERROR;
+    }
 
-        conf->request_times.times = ngx_pcalloc(cf->pool,
-                                        sizeof(ngx_http_sysguard_node_time_t) * conf->rt_number);
-
-        if (conf->request_times.times == NULL) {
-            return NGX_CONF_ERROR;
-        }
+    conf->request_times.samples = ngx_pcalloc(cf->pool,
+              conf->request_times.capacity
+                         * sizeof(ngx_http_sysguard_sample_t));
+    if (conf->request_times.samples == NULL) {
+        return NGX_CONF_ERROR;
     }
 
     return NGX_CONF_OK;
 }
 
 
+static ngx_int_t
+ngx_http_sysguard_action(ngx_str_t *value, ngx_str_t *action)
+{
+    if (value->len <= 7 || ngx_strncmp(value->data, "action=", 7) != 0
+        || (value->data[7] != '/' && value->data[7] != '@'))
+    {
+        return NGX_ERROR;
+    }
+
+    action->data = value->data + 7;
+    action->len = value->len - 7;
+    return NGX_OK;
+}
+
+
 static char *
 ngx_http_sysguard_load(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
-    ngx_http_sysguard_conf_t  *glcf = conf;
+    ngx_http_sysguard_conf_t *glcf = conf;
 
-    ngx_str_t   *value;
+    ngx_str_t   *value, number;
     ngx_uint_t   i, scale;
 
     value = cf->args->elts;
     i = 1;
     scale = 1;
 
-    if (ngx_strncmp(value[i].data, "load=", 5) == 0) {
-
-        if (glcf->load != NGX_CONF_UNSET) {
-            return "is duplicate";
-        }
-
-        if (value[i].len == 5) {
-            goto invalid;
-        }
-
-        value[i].data += 5;
-        value[i].len -= 5;
-
-        if (ngx_strncmp(value[i].data, "ncpu*", 5) == 0) {
-            value[i].data += 5;
-            value[i].len -= 5;
-            scale = ngx_ncpu;
-        }
-
-        glcf->load = ngx_atofp(value[i].data, value[i].len, 3);
-        if (glcf->load == NGX_ERROR) {
-            goto invalid;
-        }
-
-        glcf->load = glcf->load * scale;
-
-        if (cf->args->nelts == 2) {
-            return NGX_CONF_OK;
-        }
-
-        i++;
-
-        if (ngx_strncmp(value[i].data, "action=", 7) != 0) {
-            goto invalid;
-        }
-
-        if (value[i].len == 7) {
-            goto invalid;
-        }
-
-        if (value[i].data[7] != '/' && value[i].data[7] != '@') {
-            goto invalid;
-        }
-
-        glcf->load_action.data = value[i].data + 7;
-        glcf->load_action.len = value[i].len - 7;
-
-        return NGX_CONF_OK;
+    if (glcf->load != NGX_CONF_UNSET) {
+        return "is duplicate";
     }
+
+    if (value[i].len <= 5 || ngx_strncmp(value[i].data, "load=", 5) != 0) {
+        goto invalid;
+    }
+
+    number.data = value[i].data + 5;
+    number.len = value[i].len - 5;
+
+    if (number.len > 5 && ngx_strncmp(number.data, "ncpu*", 5) == 0) {
+        number.data += 5;
+        number.len -= 5;
+        scale = ngx_max(ngx_ncpu, 1);
+    }
+
+    glcf->load = ngx_atofp(number.data, number.len, 3);
+    if (glcf->load == NGX_ERROR
+        || (ngx_uint_t) glcf->load > NGX_MAX_INT_T_VALUE / scale)
+    {
+        goto invalid;
+    }
+
+    glcf->load *= scale;
+
+    if (cf->args->nelts == 3) {
+        i++;
+        if (ngx_http_sysguard_action(&value[i], &glcf->load_action) != NGX_OK) {
+            goto invalid;
+        }
+    }
+
+    return NGX_CONF_OK;
 
 invalid:
 
     ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                        "invalid parameter \"%V\"", &value[i]);
-
     return NGX_CONF_ERROR;
 }
 
@@ -605,95 +555,62 @@ invalid:
 static char *
 ngx_http_sysguard_mem(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
-    ngx_http_sysguard_conf_t  *glcf = conf;
+    ngx_http_sysguard_conf_t *glcf = conf;
 
-    ngx_str_t   *value, ss;
+    ngx_str_t   *value, size, *action;
     ngx_uint_t   i;
 
     value = cf->args->elts;
     i = 1;
 
-    if (ngx_strncmp(value[i].data, "swapratio=", 10) == 0) {
-
+    if (value[i].len > 11
+        && ngx_strncmp(value[i].data, "swapratio=", 10) == 0
+        && value[i].data[value[i].len - 1] == '%')
+    {
         if (glcf->swap != NGX_CONF_UNSET) {
             return "is duplicate";
         }
 
-        if (value[i].data[value[i].len - 1] != '%') {
-            goto invalid;
-        }
-
         glcf->swap = ngx_atofp(value[i].data + 10, value[i].len - 11, 2);
-        if (glcf->swap == NGX_ERROR) {
+        if (glcf->swap == NGX_ERROR || glcf->swap > 10000) {
             goto invalid;
         }
 
-        if (cf->args->nelts == 2) {
-            return NGX_CONF_OK;
-        }
+        action = &glcf->swap_action;
 
-        i++;
-
-        if (ngx_strncmp(value[i].data, "action=", 7) != 0) {
-            goto invalid;
-        }
-
-        if (value[i].len == 7) {
-            goto invalid;
-        }
-
-        if (value[i].data[7] != '/' && value[i].data[7] != '@') {
-            goto invalid;
-        }
-
-        glcf->swap_action.data = value[i].data + 7;
-        glcf->swap_action.len = value[i].len - 7;
-
-        return NGX_CONF_OK;
-
-    } else if (ngx_strncmp(value[i].data, "free=", 5) == 0) {
-
+    } else if (value[i].len > 5
+               && ngx_strncmp(value[i].data, "free=", 5) == 0)
+    {
         if (glcf->free != NGX_CONF_UNSET_SIZE) {
             return "is duplicate";
         }
 
-        ss.data = value[i].data + 5;
-        ss.len = value[i].len - 5;
-
-        glcf->free = ngx_parse_size(&ss);
+        size.data = value[i].data + 5;
+        size.len = value[i].len - 5;
+        glcf->free = ngx_parse_size(&size);
         if (glcf->free == (size_t) NGX_ERROR) {
             goto invalid;
         }
 
-        if (cf->args->nelts == 2) {
-            return NGX_CONF_OK;
-        }
+        action = &glcf->free_action;
 
-        i++;
-
-        if (ngx_strncmp(value[i].data, "action=", 7) != 0) {
-            goto invalid;
-        }
-
-        if (value[i].len == 7) {
-            goto invalid;
-        }
-
-        if (value[i].data[7] != '/' && value[i].data[7] != '@') {
-            goto invalid;
-        }
-
-        glcf->free_action.data = value[i].data + 7;
-        glcf->free_action.len = value[i].len - 7;
-
-        return NGX_CONF_OK;
+    } else {
+        goto invalid;
     }
+
+    if (cf->args->nelts == 3) {
+        i++;
+        if (ngx_http_sysguard_action(&value[i], action) != NGX_OK) {
+            goto invalid;
+        }
+    }
+
+    return NGX_CONF_OK;
 
 invalid:
 
     ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                        "invalid parameter \"%V\"", &value[i]);
-
     return NGX_CONF_ERROR;
 }
 
@@ -701,17 +618,19 @@ invalid:
 static char *
 ngx_http_sysguard_rt(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
-    ngx_http_sysguard_conf_t  *glcf = conf;
+    ngx_http_sysguard_conf_t *glcf = conf;
 
-    u_char      *p;
-    ngx_str_t   *value, ss;
+    ngx_str_t   *value, s;
     ngx_uint_t   i;
 
     value = cf->args->elts;
 
-    for (i = 1; i < cf->args->nelts; i++) {
-        if (ngx_strncmp(value[i].data, "rt=", 3) == 0) {
+    if (glcf->rt != NGX_CONF_UNSET) {
+        return "is duplicate";
+    }
 
+    for (i = 1; i < cf->args->nelts; i++) {
+        if (value[i].len > 3 && ngx_strncmp(value[i].data, "rt=", 3) == 0) {
             if (glcf->rt != NGX_CONF_UNSET) {
                 return "is duplicate";
             }
@@ -724,64 +643,79 @@ ngx_http_sysguard_rt(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             continue;
         }
 
-        if (ngx_strncmp(value[i].data, "period=", 7) == 0) {
+        if (value[i].len > 7 && ngx_strncmp(value[i].data, "period=", 7) == 0) {
+            if (glcf->rt_period != NGX_CONF_UNSET) {
+                return "is duplicate";
+            }
 
-            ss.data = value[i].data + 7;
-            ss.len = value[i].len - 7;
-
-            glcf->rt_period = ngx_parse_time(&ss, 1);
-            if (glcf->rt_period == NGX_ERROR) {
+            s.data = value[i].data + 7;
+            s.len = value[i].len - 7;
+            glcf->rt_period = ngx_parse_time(&s, 1);
+            if (glcf->rt_period <= 0
+                || glcf->rt_period > NGX_MAX_INT_T_VALUE / 1000)
+            {
                 goto invalid;
             }
 
             continue;
         }
 
-        if (ngx_strncmp(value[i].data, "method=", 7) == 0) {
+        if (value[i].len >= 10
+            && ngx_strncmp(value[i].data, "method=", 7) == 0)
+        {
+            if (glcf->rt_method != NGX_CONF_UNSET) {
+                return "is duplicate";
+            }
 
-            ss.data = value[i].data + 7;
-            ss.len = value[i].len - 7;
-
-            if (ngx_strncmp(ss.data, "WMA", 3) == 0) {
-                glcf->rt_method = NGX_HTTP_SYSGUARD_AVERAGE_WMA;
-
-            } else if (ngx_strncmp(ss.data, "AMM", 3) == 0) {
+            s.data = value[i].data + 7;
+            s.len = value[i].len - 7;
+            if (ngx_strncmp(s.data, "AMM", 3) == 0) {
                 glcf->rt_method = NGX_HTTP_SYSGUARD_AVERAGE_AMM;
+
+            } else if (ngx_strncmp(s.data, "WMA", 3) == 0) {
+                glcf->rt_method = NGX_HTTP_SYSGUARD_AVERAGE_WMA;
 
             } else {
                 goto invalid;
             }
 
-            p = (u_char *) ngx_strchr(ss.data, ':');
-            if (p == NULL) {
+            if (s.len == 3) {
                 continue;
             }
 
-            ss.data = p + 1;
-            ss.len = value[i].data + value[i].len - ss.data;
-            glcf->rt_number = ngx_atoi(ss.data, ss.len);
-            if (glcf->rt_number == NGX_ERROR) {
+            if (s.data[3] != ':') {
+                goto invalid;
+            }
+
+            glcf->rt_number = ngx_atoi(s.data + 4, s.len - 4);
+            if (glcf->rt_number <= 0) {
                 goto invalid;
             }
 
             continue;
         }
 
-        if (ngx_strncmp(value[i].data, "action=", 7) == 0) {
-
-            if (value[i].len == 7) {
-                goto invalid;
+        if (value[i].len > 7 && ngx_strncmp(value[i].data, "action=", 7) == 0) {
+            if (glcf->rt_action.data != NULL) {
+                return "is duplicate";
             }
 
-            if (value[i].data[7] != '/' && value[i].data[7] != '@') {
+            if (ngx_http_sysguard_action(&value[i], &glcf->rt_action)
+                != NGX_OK)
+            {
                 goto invalid;
             }
-
-            glcf->rt_action.data = value[i].data + 7;
-            glcf->rt_action.len = value[i].len - 7;
 
             continue;
         }
+
+        goto invalid;
+    }
+
+    if (glcf->rt == NGX_CONF_UNSET) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "sysguard_rt requires an rt= threshold");
+        return NGX_CONF_ERROR;
     }
 
     return NGX_CONF_OK;
@@ -790,7 +724,6 @@ invalid:
 
     ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                        "invalid parameter \"%V\"", &value[i]);
-
     return NGX_CONF_ERROR;
 }
 
@@ -798,7 +731,33 @@ invalid:
 static ngx_int_t
 ngx_http_sysguard_log_handler(ngx_http_request_t *r)
 {
-    ngx_http_sysguard_update_rt_node(r);
+    ngx_time_t                      *tp;
+    ngx_msec_int_t                   elapsed;
+    ngx_http_sysguard_ctx_t         *ctx;
+    ngx_http_sysguard_conf_t        *conf;
+    ngx_http_sysguard_main_conf_t   *mcf;
+
+    if (r != r->main) {
+        return NGX_OK;
+    }
+
+    ctx = ngx_http_sysguard_get_ctx(r, 0);
+    if (ctx != NULL && ctx->rejected) {
+        return NGX_OK;
+    }
+
+    conf = ctx ? ctx->conf
+               : ngx_http_get_module_loc_conf(r, ngx_http_sysguard_module);
+    mcf = ngx_http_get_module_main_conf(r, ngx_http_sysguard_module);
+
+    if (!mcf->rt_used && (!conf->enable || conf->rt == NGX_CONF_UNSET)) {
+        return NGX_OK;
+    }
+
+    tp = ngx_timeofday();
+    elapsed = (ngx_msec_int_t) ((tp->sec - r->start_sec) * 1000
+                               + tp->msec - r->start_msec);
+    ngx_http_sysguard_rt_add(&conf->request_times, ngx_max(elapsed, 0));
 
     return NGX_OK;
 }
@@ -807,10 +766,24 @@ ngx_http_sysguard_log_handler(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_sysguard_init(ngx_conf_t *cf)
 {
-    ngx_http_handler_pt        *h;
-    ngx_http_core_main_conf_t  *cmcf;
+    ngx_uint_t                      i;
+    ngx_http_handler_pt            *h;
+    ngx_http_variable_t            *v;
+    ngx_http_core_main_conf_t      *cmcf;
+    ngx_http_sysguard_main_conf_t  *mcf;
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+    mcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_sysguard_module);
+    v = cmcf->variables.elts;
+
+    for (i = 0; i < cmcf->variables.nelts; i++) {
+        if (v[i].name.len == sizeof("sysguard_rt") - 1
+            && ngx_strncmp(v[i].name.data, "sysguard_rt", v[i].name.len) == 0)
+        {
+            mcf->rt_used = 1;
+            break;
+        }
+    }
 
     h = ngx_array_push(&cmcf->phases[NGX_HTTP_PREACCESS_PHASE].handlers);
     if (h == NULL) {
@@ -825,8 +798,5 @@ ngx_http_sysguard_init(ngx_conf_t *cf)
     }
 
     *h = ngx_http_sysguard_log_handler;
-
     return NGX_OK;
 }
-
-/* vi:set ft=c ts=4 sw=4 et fdm=marker: */

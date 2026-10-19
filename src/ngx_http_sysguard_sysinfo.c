@@ -1,278 +1,267 @@
-
 /*
  * Copyright (C) 2010-2015 Alibaba Group Holding Limited
  * Copyright (C) YoungJoo Kim (vozlt)
+ * Copyright (C) Hanada
  */
 
 
 #include "ngx_http_sysguard_module.h"
 
+#if (NGX_HAVE_SYSINFO)
+#include <sys/sysinfo.h>
+#endif
+
+#if (NGX_FREEBSD)
+#include <sys/sysctl.h>
+#endif
+
 
 ngx_int_t
-ngx_http_sysguard_getloadavg(ngx_int_t avg[], ngx_int_t nelem, ngx_log_t *log)
+ngx_http_sysguard_getloadavg(ngx_int_t *load, ngx_log_t *log)
 {
 #if (NGX_HAVE_GETLOADAVG)
-    double     loadavg[3];
-    ngx_int_t  i;
+    double  avg;
 
-    if (getloadavg(loadavg, nelem) == -1) {
+    if (getloadavg(&avg, 1) != 1 || avg < 0
+        || avg > NGX_MAX_INT_T_VALUE / 1000)
+    {
+        ngx_log_error(NGX_LOG_ERR, log, ngx_errno, "getloadavg() failed");
         return NGX_ERROR;
     }
 
-    for (i = 0; i < nelem; i ++) {
-        avg[i] = loadavg[i] * 1000;
-    }
-
+    *load = (ngx_int_t) (avg * 1000);
     return NGX_OK;
 
 #elif (NGX_HAVE_SYSINFO)
+    struct sysinfo  info;
 
-    struct     sysinfo s;
-    ngx_int_t  i;
-
-    if (sysinfo(&s)) {
+    if (sysinfo(&info) == -1) {
+        ngx_log_error(NGX_LOG_ERR, log, ngx_errno, "sysinfo() failed");
         return NGX_ERROR;
     }
 
-    for (i = 0; i < nelem; i ++) {
-        avg[i] = s.loads[i] * 1000 / 65536;
-    }
-
+    *load = (ngx_int_t) ((double) info.loads[0] * 1000 / 65536);
     return NGX_OK;
 
 #else
-
-    ngx_log_error(NGX_LOG_EMERG, log, 0,
-                  "getloadavg is unsupported under current os");
-
     return NGX_ERROR;
 #endif
 }
+
 
 #if (NGX_HAVE_PROC_MEMINFO)
 
-static ngx_file_t                   ngx_meminfo_file;
-
-#define NGX_MEMINFO_FILE            "/proc/meminfo"
-#define NGX_MEMINFO_MAX_NAME_LEN    16
-
-
-ngx_int_t
-ngx_http_sysguard_getmeminfo(ngx_http_sysguard_meminfo_t *meminfo, ngx_log_t *log)
+static ssize_t
+ngx_http_sysguard_read_file(char *name, u_char *buf, size_t size,
+    ngx_log_t *log)
 {
-    u_char     buf[2048];
-    u_char    *p, *start, *last;
-    size_t    *sz = NULL;
-    ssize_t    n, len;
-    ngx_fd_t   fd;
-    enum {
-        sw_name = 0,
-        sw_value_start,
-        sw_value,
-        sw_skipline,
-        sw_newline,
-    } state;
+    ssize_t   n;
+    ngx_fd_t  fd;
 
-    ngx_memzero(meminfo, sizeof(ngx_http_sysguard_meminfo_t));
-
-    if (ngx_meminfo_file.fd == 0) {
-
-        fd = ngx_open_file(NGX_MEMINFO_FILE, NGX_FILE_RDONLY,
-                           NGX_FILE_OPEN,
-                           NGX_FILE_DEFAULT_ACCESS);
-
-        if (fd == NGX_INVALID_FILE) {
-            ngx_log_error(NGX_LOG_EMERG, log, ngx_errno,
-                          ngx_open_file_n " \"%s\" failed",
-                          NGX_MEMINFO_FILE);
-
-            return NGX_ERROR;
-        }
-
-        ngx_meminfo_file.name.data = (u_char *) NGX_MEMINFO_FILE;
-        ngx_meminfo_file.name.len = ngx_strlen(NGX_MEMINFO_FILE);
-
-        ngx_meminfo_file.fd = fd;
-    }
-
-    ngx_meminfo_file.log = log;
-    n = ngx_read_file(&ngx_meminfo_file, buf, sizeof(buf) - 1, 0);
-    if (n == NGX_ERROR) {
-        ngx_log_error(NGX_LOG_ALERT, log, ngx_errno,
-                      ngx_read_file_n " \"%s\" failed",
-                      NGX_MEMINFO_FILE);
-
+    fd = ngx_open_file(name, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+    if (fd == NGX_INVALID_FILE) {
+        ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                      ngx_open_file_n " \"%s\" failed", name);
         return NGX_ERROR;
     }
 
-    p = buf;
-    start = buf;
+    do {
+        n = ngx_read_fd(fd, buf, size);
+    } while (n == -1 && ngx_errno == NGX_EINTR);
+
+    if (n == -1) {
+        ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                      ngx_read_fd_n " \"%s\" failed", name);
+    }
+
+    if (ngx_close_file(fd) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ALERT, log, ngx_errno,
+                      ngx_close_file_n " \"%s\" failed", name);
+    }
+
+    return n;
+}
+
+
+ngx_int_t
+ngx_http_sysguard_getmeminfo(ngx_http_sysguard_meminfo_t *mem, ngx_log_t *log)
+{
+    u_char      *p, *last, *end, *value, *digits;
+    size_t      *field;
+    ssize_t      n, size;
+    ngx_uint_t   i, seen;
+    u_char       buf[4096];
+    static struct {
+        ngx_str_t  name;
+        size_t     offset;
+    } fields[] = {
+        { ngx_string("MemTotal:"),
+          offsetof(ngx_http_sysguard_meminfo_t, totalram) },
+        { ngx_string("MemFree:"),
+          offsetof(ngx_http_sysguard_meminfo_t, freeram) },
+        { ngx_string("Buffers:"),
+          offsetof(ngx_http_sysguard_meminfo_t, bufferram) },
+        { ngx_string("Cached:"),
+          offsetof(ngx_http_sysguard_meminfo_t, cachedram) },
+        { ngx_string("SwapTotal:"),
+          offsetof(ngx_http_sysguard_meminfo_t, totalswap) },
+        { ngx_string("SwapFree:"),
+          offsetof(ngx_http_sysguard_meminfo_t, freeswap) }
+    };
+
+    ngx_memzero(mem, sizeof(ngx_http_sysguard_meminfo_t));
+    n = ngx_http_sysguard_read_file("/proc/meminfo", buf, sizeof(buf), log);
+    if (n <= 0) {
+        return NGX_ERROR;
+    }
+
+    seen = 0;
     last = buf + n;
-    state = sw_name;
 
-    for (; p < last; p++) {
-
-        if (*p == '\n') {
-            state = sw_newline;
+    for (p = buf; p < last; p = end + 1) {
+        end = ngx_strlchr(p, last, '\n');
+        if (end == NULL) {
+            break;
         }
 
-        switch (state) {
-
-        case sw_name:
-            if (*p != ':') {
+        for (i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+            if ((size_t) (end - p) < fields[i].name.len
+                || ngx_strncmp(p, fields[i].name.data, fields[i].name.len) != 0)
+            {
                 continue;
             }
 
-            len = p - start;
-            sz = NULL;
-
-            switch (len) {
-            case 6:
-                /* Cached */
-                if (meminfo->cachedram == 0 &&
-                    ngx_strncmp(start, "Cached", len) == 0)
-                {
-                    sz = &meminfo->cachedram;
-                }
-                break;
-            case 7:
-                /* Buffers MemFree */
-                if (meminfo->bufferram == 0 &&
-                    ngx_strncmp(start, "Buffers", len) == 0)
-                {
-                    sz = &meminfo->bufferram;
-                } else if (meminfo->freeram == 0 &&
-                           ngx_strncmp(start, "MemFree", len) == 0)
-                {
-                    sz = &meminfo->freeram;
-                }
-                break;
-            case 8:
-                /* MemTotal SwapFree */
-                if (meminfo->totalram == 0 &&
-                    ngx_strncmp(start, "MemTotal", len) == 0)
-                {
-                    sz = &meminfo->totalram;
-                } else if (meminfo->freeswap == 0 &&
-                           ngx_strncmp(start, "SwapFree", len) == 0)
-                {
-                    sz = &meminfo->freeswap;
-                }
-                break;
-            case 9:
-                /* SwapTotal */
-                if (meminfo->totalswap == 0 &&
-                    ngx_strncmp(start, "SwapTotal", len) == 0)
-                {
-                    sz = &meminfo->totalswap;
-                }
-                break;
+            if (seen & (1 << i)) {
+                goto invalid;
             }
 
-            if (sz == NULL) {
-                state = sw_skipline;
-                continue;
+            value = p + fields[i].name.len;
+            while (value < end && (*value == ' ' || *value == '\t')) {
+                value++;
             }
 
-            state = sw_value_start;
-
-            continue;
-
-        case sw_value_start:
-
-            if (*p == ' ') {
-                continue;
+            digits = value;
+            while (value < end && *value >= '0' && *value <= '9') {
+                value++;
             }
 
-            start = p;
-            state = sw_value;
-
-            continue;
-
-        case sw_value:
-
-            if (*p >= '0' && *p <= '9') {
-                continue;
+            size = ngx_atosz(digits, value - digits);
+            if (size == NGX_ERROR
+                || (size_t) size > NGX_MAX_SIZE_T_VALUE / 1024)
+            {
+                goto invalid;
             }
 
-            *(sz) =  ngx_atosz(start, p - start) * 1024;
+            while (value < end && (*value == ' ' || *value == '\t')) {
+                value++;
+            }
 
-            state = sw_skipline;
+            if (end - value != 2 || ngx_strncmp(value, "kB", 2) != 0) {
+                goto invalid;
+            }
 
-            continue;
-
-        case sw_skipline:
-
-            continue;
-
-        case sw_newline:
-
-            state = sw_name;
-            start = p + 1;
-
-            continue;
+            field = (size_t *) ((u_char *) mem + fields[i].offset);
+            *field = (size_t) size * 1024;
+            seen |= 1 << i;
+            break;
         }
     }
 
+    if (seen != 63 || mem->freeswap > mem->totalswap
+        || mem->cachedram > NGX_MAX_SIZE_T_VALUE - mem->freeram
+        || mem->bufferram
+           > NGX_MAX_SIZE_T_VALUE - mem->freeram - mem->cachedram)
+    {
+        goto invalid;
+    }
+
+    mem->swap_available = 1;
     return NGX_OK;
+
+invalid:
+
+    ngx_log_error(NGX_LOG_ERR, log, 0, "invalid /proc/meminfo data");
+    return NGX_ERROR;
 }
 
-#elif (NGX_HAVE_VM_STATS)
+
+#elif (NGX_FREEBSD)
 
 static ngx_int_t
-ngx_http_sysguard_vm_stats(const char *name, size_t *res, ngx_log_t *log)
+ngx_http_sysguard_sysctl(char *name, size_t *value)
 {
-    size_t val;
-    size_t reslen = sizeof(size_t);
-    *res = 0;
+    size_t  len;
+    union {
+        uint32_t  u32;
+        uint64_t  u64;
+    } data;
 
-    if (sysctlbyname(name, &val, &reslen, NULL, 0) == -1) {
-        ngx_log_error(NGX_LOG_EMERG, log, ngx_errno,
-                "sysctl \"%s\" failed", name);
+    ngx_memzero(&data, sizeof(data));
+    len = sizeof(data);
+
+    if (sysctlbyname(name, &data, &len, NULL, 0) == -1) {
         return NGX_ERROR;
     }
 
-    *res = val;
+    if (len == sizeof(uint32_t)) {
+        *value = data.u32;
+
+    } else if (len == sizeof(uint64_t) && data.u64 <= NGX_MAX_SIZE_T_VALUE) {
+        *value = (size_t) data.u64;
+
+    } else {
+        return NGX_ERROR;
+    }
 
     return NGX_OK;
 }
+
 
 ngx_int_t
-ngx_http_sysguard_getmeminfo(ngx_http_sysguard_meminfo_t *meminfo, ngx_log_t *log)
+ngx_http_sysguard_getmeminfo(ngx_http_sysguard_meminfo_t *mem, ngx_log_t *log)
 {
-    ngx_memzero(meminfo, sizeof(ngx_http_sysguard_meminfo_t));
+    ngx_memzero(mem, sizeof(ngx_http_sysguard_meminfo_t));
 
-    if (ngx_http_sysguard_vm_stats("vfs.bufspace",
-        &meminfo->bufferram, log) != NGX_OK) {
+    if (ngx_http_sysguard_sysctl("hw.physmem", &mem->totalram) != NGX_OK
+        || ngx_http_sysguard_sysctl("vm.stats.vm.v_free_count", &mem->freeram)
+           != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                      "sysctlbyname() failed to read memory information");
         return NGX_ERROR;
     }
-    if (ngx_http_sysguard_vm_stats("vm.stats.vm.v_cache_count",
-        &meminfo->cachedram, log) != NGX_OK) {
+
+    /* These optional counters are absent on some FreeBSD releases. */
+    (void) ngx_http_sysguard_sysctl("vm.stats.vm.v_cache_count",
+                                    &mem->cachedram);
+    (void) ngx_http_sysguard_sysctl("vfs.bufspace", &mem->bufferram);
+
+    if (mem->freeram > NGX_MAX_SIZE_T_VALUE / ngx_pagesize
+        || mem->cachedram > NGX_MAX_SIZE_T_VALUE / ngx_pagesize)
+    {
         return NGX_ERROR;
     }
-    if (ngx_http_sysguard_vm_stats("vm.stats.vm.v_free_count",
-        &meminfo->freeram, log) != NGX_OK) {
-        return NGX_ERROR;
-    }
-    if (ngx_http_sysguard_vm_stats("hw.usermem",
-        &meminfo->totalram, log) != NGX_OK) {
+
+    mem->freeram *= ngx_pagesize;
+    mem->cachedram *= ngx_pagesize;
+
+    if (mem->cachedram > NGX_MAX_SIZE_T_VALUE - mem->freeram
+        || mem->bufferram
+           > NGX_MAX_SIZE_T_VALUE - mem->freeram - mem->cachedram)
+    {
         return NGX_ERROR;
     }
 
     return NGX_OK;
 }
+
+
 #else
 
 ngx_int_t
-ngx_http_sysguard_getmeminfo(ngx_http_sysguard_meminfo_t *meminfo, ngx_log_t *log)
+ngx_http_sysguard_getmeminfo(ngx_http_sysguard_meminfo_t *mem, ngx_log_t *log)
 {
-    ngx_log_error(NGX_LOG_EMERG, log, 0,
-                  "getmeminfo is unsupported under current os");
-
     return NGX_ERROR;
 }
 
 #endif
-
-
-/* vi:set ft=c ts=4 sw=4 et fdm=marker: */
